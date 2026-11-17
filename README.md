@@ -72,6 +72,53 @@ curl -s localhost:8000/builds/1/steps/compile/logs
 curl -s -X POST localhost:8000/builds/1/cancel
 ```
 
+## 工件发布（交付下游烧录系统）
+
+成功构建可将工作目录内的**单个普通文件**发布为不可变工件，供下游烧录系统下载。
+
+```bash
+# 发布（构建必须已是 succeeded）
+curl -s -X POST localhost:8000/artifacts \
+  -H 'Content-Type: application/json' \
+  -d '{"build_id": 1, "path": "out/firmware.tar.gz"}'
+# 工件元信息
+curl -s localhost:8000/builds/1/artifact
+# 下载
+curl -s -OJ localhost:8000/builds/1/artifact/content
+```
+
+| 场景 | 行为 |
+| --- | --- |
+| 首次发布 | `201`，返回 `build_id / path / size / sha256 / created_at / download_url` |
+| 同构建同路径重试 | `200`，原样返回首次工件（`replayed=true`），不重新读取源文件 |
+| 同构建换路径 | `409`，每个构建只认首次发布的路径 |
+| 构建非 `succeeded` | `409`；构建不存在 `404` |
+| 路径越界/符号链接/非普通文件 | `400`；源文件不存在 `404` |
+| 未发布即查询/下载 | `404` |
+| 已登记 blob 缺失或摘要不符 | `500`，绝不返回不一致内容 |
+
+语义与安全要点：
+
+1. **只认普通文件**：路径必须是工作目录内的规范相对路径（拒绝绝对路径、
+   `..`、`.`、空段、反斜杠）。逐级以 `O_NOFOLLOW` 打开，任何层级的符号链接、
+   目录、FIFO、设备文件都被拒绝；打开后以 fd 为准再 `fstat` 确认。
+2. **内容固化**：发布时在“校验后”的文件描述符上复制内容，边复制边计算
+   SHA-256，`fsync` 后原子 `rename` 到 `artifacts/blobs/<build_id>/<uuid>.bin`。
+   之后工作目录里的改动、替换或删除都不影响已发布内容。
+3. **先落盘、后登记**：blob 完整持久化之后才插入数据库记录（唯一的
+   `UNIQUE(build_id)` 约束）。数据库记录是“已确认”的提交点：有记录必有完整
+   blob；中断在登记前只会留下临时文件或孤儿 blob，**不会被任何接口暴露为可
+   下载工件**，原请求可安全重试。
+4. **并发安全**：同一构建的发布由进程内 per-build 锁串行化，唯一约束兜底
+   多进程竞态；并发请求中只有一个 `201`，其余返回同一份工件。
+5. **下载强校验**：每次下载前按记录重新计算大小与 SHA-256，通过后才从同一
+   fd 流式输出，并返回 `Content-Length`、`ETag`、`X-Artifact-SHA256`。
+6. **重启语义**：blob 与记录都在命名卷 `/data` 中。已确认工件重启后仍可
+   下载；启动时清空 `artifacts/tmp` 与无记录的孤儿 blob，之后才对外服务。
+
+工件存储位于 `$PIPELINE_DATA_DIR/artifacts/`（`blobs/` 为已确认内容，
+`tmp/` 为复制中的临时文件）。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -81,8 +128,11 @@ curl -s -X POST localhost:8000/builds/1/cancel
 | GET | `/builds/{id}` | 构建与全部步骤状态 |
 | POST | `/builds/{id}/cancel` | 整次取消（幂等） |
 | GET | `/builds/{id}/steps/{step_id}/logs?tail=N` | 步骤日志 |
-| GET | `/health` | 健康检查与最近一次启动恢复报告 |
-| GET | `/docs` | Swagger UI |
+| POST | `/artifacts` | 发布工件（首次 201，同路径重试 200，换路径 409） |
+| GET | `/builds/{id}/artifact` | 工件元信息 |
+| GET | `/builds/{id}/artifact/content` | 下载已发布工件（校验摘要后流式返回） |
+| GET | `/health` | 健康检查、最近一次启动恢复与工件清理报告 |
+| GET | `/docs` | Swagger UI（含上述发布/下载接口） |
 
 ## 进程组与重启恢复的关键设计
 
@@ -107,6 +157,11 @@ curl -s -X POST localhost:8000/builds/1/cancel
 - `tests/test_integration.py`：以真实 uvicorn 子进程端到端验证成功、失败跳过、
   慢子进程清理判失败、超时、并行上限 2、整次取消、重复取消幂等、慢清理不占
   另一名额、重启恢复（含不误杀后来构建）、错误请求与文档接口。
+- `tests/test_artifacts_unit.py`：工件路径规范化、符号链接/非普通文件拒绝、
+  快照与源文件解耦。
+- `tests/test_artifacts_integration.py`：发布/下载往返、工作目录改动不影响
+  已发布内容、同路径幂等与换路径冲突、并发发布唯一提交、越界与符号链接拒绝、
+  登记前中断后的清理与安全重试、确认工件跨重启仍可下载、blob 缺失不返回内容。
 
 ## 配置（环境变量）
 

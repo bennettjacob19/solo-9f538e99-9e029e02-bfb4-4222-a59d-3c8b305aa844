@@ -83,6 +83,22 @@ class CancelOut(BaseModel):
     detail: str
 
 
+class ArtifactPublishIn(BaseModel):
+    build_id: Annotated[int, Field(ge=1)]
+    path: Annotated[str, Field(min_length=1, max_length=4096)]
+
+
+class ArtifactOut(BaseModel):
+    build_id: int
+    path: str
+    size: int
+    sha256: str
+    content_type: str
+    created_at: str
+    download_url: str
+    replayed: bool = False
+
+
 def validate_dag(steps: list[StepIn]) -> None:
     """结构之外的 DAG 语义校验：重复 id、悬空依赖、自依赖、有环。"""
     ids = [s.id for s in steps]

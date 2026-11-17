@@ -4,17 +4,30 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 from pathlib import Path
+from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi.responses import StreamingResponse
 
 from . import __version__, config
+from .artifacts import ArtifactError, ArtifactService
 from .db import Database
-from .models import BuildCreate, BuildOut, CancelOut, LogOut, StepOut
+from .models import (
+    ArtifactOut,
+    ArtifactPublishIn,
+    BuildCreate,
+    BuildOut,
+    CancelOut,
+    LogOut,
+    StepOut,
+)
 from .scheduler import Scheduler
 
 db = Database()
 scheduler = Scheduler(db)
+artifact_service = ArtifactService(db)
 
 
 def _step_out(row) -> StepOut:
@@ -49,10 +62,33 @@ async def _build_out(build_id: int) -> BuildOut:
     )
 
 
+def _safe_filename(name: str) -> str:
+    """生成仅含安全 ASCII 的下载文件名，避免响应头注入或编码问题。"""
+    cleaned = "".join(
+        ch if ch.isascii() and (ch.isalnum() or ch in "._-") else "_" for ch in name
+    ).strip("._") or "artifact.bin"
+    return cleaned[:200]
+
+
+def _artifact_out(row: dict, replayed: bool = False) -> ArtifactOut:
+    return ArtifactOut(
+        build_id=row["build_id"],
+        path=row["source_path"],
+        size=row["size"],
+        sha256=row["sha256"],
+        content_type=row["content_type"],
+        created_at=row["created_at"],
+        download_url=f"/builds/{row['build_id']}/artifact/content",
+        replayed=replayed,
+    )
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
     # 顺序不可颠倒：先落库连接，再清空旧构建残留并标记中断，最后才对外服务
     await db.connect()
+    # 清理未确认的工件临时文件/孤儿 blob；已登记的工件不受影响
+    app.state.artifact_cleanup = await artifact_service.startup()
     app.state.recovery = await scheduler.recover()
     try:
         yield
@@ -67,6 +103,7 @@ app = FastAPI(
         "接收最多 12 步的 JSON DAG，在挂载工作目录中执行真实命令；"
         "全局最多两步并行，依赖全成功才启动，失败后代跳过，"
         "超时/取消终止整个进程组，支持逐步状态与日志查询。"
+        "成功构建可将工作目录内的单个普通文件发布为不可变工件（固定内容与 SHA-256）。"
     ),
     lifespan=lifespan,
 )
@@ -80,6 +117,7 @@ async def health() -> dict:
         "max_steps": config.MAX_STEPS,
         "max_parallel": config.MAX_PARALLEL,
         "recovery": getattr(app.state, "recovery", None),
+        "artifact_cleanup": getattr(app.state, "artifact_cleanup", None),
     }
 
 
@@ -147,4 +185,76 @@ async def get_step_log(
         status=step["status"],
         truncated=truncated,
         content=content,
+    )
+
+
+# --------------------------------------------------------------- 工件发布
+
+@app.post(
+    "/artifacts",
+    response_model=ArtifactOut,
+    status_code=201,
+    responses={
+        200: {
+            "model": ArtifactOut,
+            "description": "同一构建的同一路径重复发布，返回首次发布的原工件",
+        }
+    },
+)
+async def publish_artifact(payload: ArtifactPublishIn, response: Response) -> ArtifactOut:
+    """发布成功构建工作目录内的单个普通文件。
+
+    首次发布返回 201；同路径重试返回 200 与首次发布的内容/摘要；换路径返回 409。
+    内容在登记前已复制并固化为不可变 blob，工作目录后续改动不影响下载。
+    """
+    try:
+        row, created = await artifact_service.publish(payload.build_id, payload.path)
+    except ArtifactError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    response.status_code = 201 if created else 200
+    return _artifact_out(row, replayed=not created)
+
+
+@app.get("/builds/{build_id}/artifact", response_model=ArtifactOut)
+async def get_artifact(build_id: int) -> ArtifactOut:
+    try:
+        row = await artifact_service.get(build_id)
+    except ArtifactError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+    return _artifact_out(row)
+
+
+@app.get(
+    "/builds/{build_id}/artifact/content",
+    response_class=StreamingResponse,
+    responses={200: {"content": {"application/octet-stream": {}}}},
+)
+async def download_artifact(build_id: int) -> StreamingResponse:
+    try:
+        row, fd = await artifact_service.open_verified(build_id)
+    except ArtifactError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    filename = _safe_filename(row["source_path"].rsplit("/", 1)[-1])
+
+    async def _stream() -> AsyncIterator[bytes]:
+        try:
+            offset = 0
+            while True:
+                chunk = await asyncio.to_thread(os.pread, fd, 1024 * 1024, offset)
+                if not chunk:
+                    break
+                offset += len(chunk)
+                yield chunk
+        finally:
+            os.close(fd)
+
+    headers = {
+        "Content-Length": str(row["size"]),
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "ETag": f'"{row["sha256"]}"',
+        "X-Artifact-SHA256": row["sha256"],
+    }
+    return StreamingResponse(
+        _stream(), media_type=row["content_type"], headers=headers
     )

@@ -18,6 +18,11 @@ DB_PATH = DATA_DIR / "pipeline.db"
 WORKDIR_ROOT = DATA_DIR / "workdir"
 LOG_ROOT = DATA_DIR / "logs"
 
+# 已发布工件：blobs 为不可变内容，tmp 为复制中的临时文件
+ARTIFACT_ROOT = DATA_DIR / "artifacts"
+ARTIFACT_BLOB_ROOT = ARTIFACT_ROOT / "blobs"
+ARTIFACT_TMP_ROOT = ARTIFACT_ROOT / "tmp"
+
 # 业务约束
 MAX_STEPS = int(os.environ.get("PIPELINE_MAX_STEPS", "12"))
 MAX_PARALLEL = int(os.environ.get("PIPELINE_MAX_PARALLEL", "2"))
@@ -36,5 +41,12 @@ LOG_MAX_BYTES = int(os.environ.get("PIPELINE_LOG_MAX_BYTES", str(1024 * 1024)))
 
 
 def ensure_dirs() -> None:
-    for path in (DATA_DIR, WORKDIR_ROOT, LOG_ROOT):
+    for path in (
+        DATA_DIR,
+        WORKDIR_ROOT,
+        LOG_ROOT,
+        ARTIFACT_ROOT,
+        ARTIFACT_BLOB_ROOT,
+        ARTIFACT_TMP_ROOT,
+    ):
         path.mkdir(parents=True, exist_ok=True)

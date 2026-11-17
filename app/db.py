@@ -38,6 +38,20 @@ CREATE TABLE IF NOT EXISTS steps (
     UNIQUE(build_id, step_uid),
     FOREIGN KEY(build_id) REFERENCES builds(id)
 );
+-- 每个构建只允许一条工件记录；记录的提交点晚于内容落盘
+CREATE TABLE IF NOT EXISTS artifacts (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    build_id      INTEGER NOT NULL UNIQUE,
+    source_path   TEXT NOT NULL,
+    size          INTEGER NOT NULL,
+    sha256        TEXT NOT NULL,
+    content_type  TEXT NOT NULL,
+    storage_path  TEXT NOT NULL UNIQUE,
+    created_at    TEXT NOT NULL,
+    FOREIGN KEY(build_id) REFERENCES builds(id)
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_storage_path
+    ON artifacts(storage_path);
 """
 
 
@@ -205,3 +219,35 @@ class Database:
             f"SELECT * FROM steps WHERE build_id IN ({placeholders}) ORDER BY id",
             build_ids,
         )
+
+    # ---- 工件 -----------------------------------------------------------
+
+    async def insert_artifact(
+        self,
+        build_id: int,
+        source_path: str,
+        size: int,
+        sha256: str,
+        content_type: str,
+        storage_path: str,
+        now: str,
+    ) -> int:
+        """向 artifacts 表插入记录的提交点；违反 build_id 唯一约束时抛 IntegrityError。"""
+        return await self.execute(
+            """
+            INSERT INTO artifacts
+                (build_id, source_path, size, sha256, content_type,
+                 storage_path, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (build_id, source_path, size, sha256, content_type, storage_path, now),
+        )
+
+    async def get_artifact(self, build_id: int) -> Optional[aiosqlite.Row]:
+        return await self.one(
+            "SELECT * FROM artifacts WHERE build_id=?", (build_id,)
+        )
+
+    async def list_artifact_storage_paths(self) -> list[str]:
+        rows = await self.all("SELECT storage_path FROM artifacts")
+        return [r["storage_path"] for r in rows]
